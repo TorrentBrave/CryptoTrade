@@ -67,10 +67,14 @@ print()
 #         Y.append(dataset[i + look_back, 0])
 #     return np.array(X), np.array(Y)
 
-def create_dataset(dataset, look_back=5):
+def create_dataset(dataset, look_back=5, extra_features=None):
+    # 支持多指标融合
     X, Y = [], []
     for i in range(len(dataset)-look_back):
         a = dataset[i:(i+look_back), :]
+        if extra_features is not None:
+            # 拼接Agent等结构化特征
+            a = np.concatenate([a, extra_features[i:(i+look_back)]], axis=1)
         X.append(a)
         Y.append(dataset[i + look_back, 0])
     return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(np.array(Y), dtype=torch.float32).view(-1, 1)
@@ -92,6 +96,34 @@ class LSTMModel(nn.Module):
         out, (hn, cn) = self.lstm(x, (h0.detach(), c0.detach()))
         out = self.fc(out[:, -1, :]) 
         return out
+
+# ==== 新增：多模型结构 ====
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, d_model=64, nhead=4, num_layers=2, output_dim=1):
+        super().__init__()
+        self.input_linear = nn.Linear(input_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(d_model, output_dim)
+    def forward(self, x):
+        # x: (batch, seq, input_dim)
+        x = self.input_linear(x)
+        x = x.permute(1, 0, 2)  # (seq, batch, d_model)
+        x = self.transformer(x)
+        x = x[-1]  # 取最后一个时间步
+        return self.fc(x)
+
+class ALSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_layers=2, output_dim=1):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.attn = nn.Linear(hidden_dim, 1)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        attn_weights = torch.softmax(self.attn(out), dim=1)
+        context = (out * attn_weights).sum(dim=1)
+        return self.fc(context)
 
 # # LSTM strategy function
 # def lstm_strategy(df, start_date, end_date, look_back=1):
@@ -136,58 +168,46 @@ class LSTMModel(nn.Module):
 #     return action
 
  
-def lstm_strategy(df, start_date, end_date, look_back=5):
-    # Filter the data
+def lstm_strategy(df, start_date, end_date, look_back=5, model_type='LSTM', tpe_config=None):
+    # 多指标融合
     data = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
-    data = data['open'].values.reshape(-1, 1)
-    
-    # Scale the data
+    # 选取多指标
+    features = ['open', 'volume', 'SMA_5', 'MACD']  # 可扩展
+    data_values = data[features].values
     scaler = MinMaxScaler(feature_range=(0, 1))
-    data_scaled = scaler.fit_transform(data)
-    # Assuming `data_scaled` is your scaled dataset as a NumPy array
-    X, Y = create_dataset(data_scaled, look_back)
+    data_scaled = scaler.fit_transform(data_values)
+    # Agent结构化特征
+    extra_features = get_extra_features(df, start_date, end_date)
+    X, Y = create_dataset(data_scaled, look_back, extra_features=extra_features)
     dataset = TensorDataset(X, Y)
     train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
-
-    # Initialize the model, loss function, and optimizer
-    model = LSTMModel(input_dim=1, hidden_dim=100, num_layers=2, output_dim=1).to(device)
+    model = get_model(model_type, input_dim=X.shape[2])
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    # Training loop
-    num_epochs = 100
-    for epoch in range(num_epochs):
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-        
-        if epoch % 10 == 0:
-            print(f'Epoch {epoch}, Loss: {loss.item()}')    
-            
-    # Prepare the last training batch for prediction
-    last_sequence = data_scaled[-look_back:]  # Get the last 'look_back' sequences
-    last_sequence = torch.tensor(last_sequence, dtype=torch.float32).unsqueeze(0).to(device)  # Add batch dimension
-
+    train_model(model, train_loader, criterion, optimizer, num_epochs=100, tpe_config=tpe_config)
+    last_sequence = data_scaled[-look_back:]
+    last_extra = extra_features[-look_back:]
+    last_input = np.concatenate([last_sequence, last_extra], axis=1)
+    last_input = torch.tensor(last_input, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
         model.eval()
-        next_day_prediction = model(last_sequence)  # Predict
-        next_day_prediction = next_day_prediction.cpu()  # Convert to NumPy array
-
-    next_day_prediction = scaler.inverse_transform(next_day_prediction.numpy())  # Scale back to original range
-    current_price = scaler.inverse_transform([[Y[-1].item()]])
-
-    action = 'Hold'  # Default action
-    if next_day_prediction > current_price:
+        next_day_prediction = model(last_input)
+        next_day_prediction = next_day_prediction.cpu()
+    next_day_prediction = scaler.inverse_transform(
+        np.concatenate([next_day_prediction.numpy(), np.zeros((1, len(features)-1))], axis=1)
+    )[0, 0]
+    current_price = scaler.inverse_transform(
+        np.concatenate([[Y[-1].item()], np.zeros(len(features)-1)]).reshape(1, -1)
+    )[0, 0]
+    # 反思Agent反馈
+    feedback = reflection_agent_feedback(next_day_prediction, current_price)
+    action = 'Hold'
+    if next_day_prediction > current_price + feedback:
         action = 'Buy'
-    elif next_day_prediction < current_price:
+    elif next_day_prediction < current_price + feedback:
         action = 'Sell'
     else:
         action = 0
-
     return action
 
 # 1st strategy: Simple MA 
@@ -313,9 +333,15 @@ def run_strategy(strategy, sargs):
             if cash > 0:
                 action = FULL_BUY
         
-        # here to add LSTM strategy
-        elif strategy == 'LSTM':
-            action = lstm_strategy(df, sargs['starting_date'], sargs['ending_date'], look_back=5)
+        # here to add LSTM/Transformer/ALSTM等多模型策略
+        elif strategy in ['LSTM', 'Transformer', 'ALSTM']:
+            # 支持多模型选择与训练管道增强
+            action = lstm_strategy(
+                df, sargs['starting_date'], sargs['ending_date'],
+                look_back=5,
+                model_type=strategy,
+                tpe_config={'zero_bias': True, 'time_weight': True}
+            )
             if action == 'Buy' and cash > 0:
                 action = BUY
             elif action == 'Sell' and eth_held > 0:
@@ -406,3 +432,94 @@ multiplier = 2
 sargs = {'period': period, 'multiplier': multiplier, 'starting_date': TEST_START, 'ending_date': TEST_END}
 print(f'{strategy}, Period: {period}, Multiplier: {multiplier}')
 run_strategy(strategy, sargs)
+
+# ==== 预留：细粒度实时预测与可视化接口 ====
+def realtime_predict_and_visualize(df, model, interval='1min', look_back=5, features=None, scaler=None):
+    """
+    实时预测与动态可视化
+    df: 包含历史数据的DataFrame，需有'date'列
+    model: 已训练好的时序模型
+    interval: 预测步长（如'1min'）
+    look_back: 滑动窗口长度
+    features: 用于模型输入的特征名列表
+    scaler: 训练时用的scaler
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    if features is None:
+        features = ['open', 'volume', 'SMA_5', 'MACD']
+    if scaler is None:
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaler.fit(df[features].values)
+
+    # 按interval重采样（如需分钟级，需有分钟数据）
+    df_sorted = df.sort_values('date').reset_index(drop=True)
+    # 若数据为日线，interval可忽略
+    data_values = df_sorted[features].values
+    data_scaled = scaler.transform(data_values)
+
+    pred_dates = []
+    pred_prices = []
+    true_prices = []
+
+    for i in range(look_back, len(df_sorted)):
+        input_seq = data_scaled[i-look_back:i]
+        input_tensor = torch.tensor(input_seq, dtype=torch.float32).unsqueeze(0).to(model.fc.weight.device)
+        with torch.no_grad():
+            model.eval()
+            pred = model(input_tensor).cpu().numpy()
+        # 反归一化，仅取open
+        pred_full = np.concatenate([pred, np.zeros((1, len(features)-1))], axis=1)
+        pred_price = scaler.inverse_transform(pred_full)[0, 0]
+        true_price = df_sorted.iloc[i]['open']
+        pred_dates.append(df_sorted.iloc[i]['date'])
+        pred_prices.append(pred_price)
+        true_prices.append(true_price)
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(pred_dates, true_prices, label='真实价格', color='blue')
+    plt.plot(pred_dates, pred_prices, label='实时预测', color='orange')
+    plt.fill_between(pred_dates, np.array(pred_prices)*0.98, np.array(pred_prices)*1.02, color='orange', alpha=0.2, label='预测置信区间')
+    plt.xlabel('时间')
+    plt.ylabel('价格')
+    plt.title('实时预测价格与实际价格对比')
+    plt.legend()
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    plt.show()
+
+
+# ====== 示例：训练模型并可视化预测 ======
+if __name__ == '__main__':
+    # 选择测试区间
+    test_df = df[(df['date'] >= TEST_START) & (df['date'] <= TEST_END)].reset_index(drop=True)
+    # 修正特征，移除volume
+    features = ['open', 'SMA_5', 'MACD']
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler.fit(test_df[features].values)
+    look_back = 5
+
+    # 构造数据集
+    data_values = test_df[features].values
+    data_scaled = scaler.transform(data_values)
+    X, Y = create_dataset(data_scaled, look_back)
+    dataset = TensorDataset(X, Y)
+    train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+    # 训练LSTM模型（可换成Transformer/ALSTM）
+    model = LSTMModel(input_dim=X.shape[2], hidden_dim=100, num_layers=2, output_dim=1).to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    for epoch in range(30):  # 训练轮数可调
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+    # 可视化预测
+    realtime_predict_and_visualize(test_df, model, look_back=look_back, features=features, scaler=scaler)

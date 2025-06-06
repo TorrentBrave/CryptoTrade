@@ -11,6 +11,7 @@ import importlib
 from utils import Model, get_chat
 from eth_env import ETHTradingEnv
 from env_history import EnvironmentHistory
+from ragen_agent import RAGENAgent
 
 from typing import List, Dict, Any, Tuple
  
