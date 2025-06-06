@@ -31,6 +31,19 @@ def get_paths(args):
 
 
 class ETHTradingEnv:
+    """
+    以太坊交易环境，用于训练和评估交易策略（如强化学习或语言模型驱动的策略）。环境模拟了每天的交易，并在每一步更新持仓、现金、净值、技术指标、新闻等数据
+    
+    接收动作（买入/卖出比例），执行交易，计算净值与奖励，并推进至下一状态。
+    
+    参数：
+        action (float or str): 表示交易意图的值（-1~1）
+    返回：
+        close_state: 下一天环境状态
+        reward: 当前步的收益差
+        done: 是否结束
+        info: 附加调试信息
+    """
     def __init__(self, args):
         price_path, txn_path, self.news_dir, self.timecol, self.price_timefmt, txn_timefmt = get_paths(args)
         starting_date, ending_date = args.starting_date, args.ending_date

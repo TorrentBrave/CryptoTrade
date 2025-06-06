@@ -2,6 +2,17 @@ from utils import get_chat
 
 from typing import List, Dict, Any
 
+"""
+构造反思用的提示词，鼓励 Agent 回顾失败经验并生成新策略。
+    
+参数：
+    log_str: 当前尝试的完整日志
+    memory: 过往最多三次的反思
+返回：
+    提示词: prompt 用于调用 GPT 的输入
+
+"""
+
 def _get_scenario(s: str) -> str:
     """Parses the relevant scenario from the experience log."""
     return s.split("Here is the task:")[-1].strip()

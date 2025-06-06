@@ -207,7 +207,7 @@ def lstm_strategy(df, start_date, end_date, look_back=5):
 
 
 def run_strategy(strategy, sargs):
-    env = ETHTradingEnv(Namespace(starting_date=sargs['starting_date'], ending_date=sargs['ending_date']))
+    env = ETHTradingEnv(Namespace(starting_date=sargs['starting_date'], ending_date=sargs['ending_date'], dataset='eth'))
     df_tmp = df[(df['date'] >= sargs['starting_date']) & (df['date'] <= sargs['ending_date'])]
     df_tmp.reset_index(drop=True, inplace=True)
     state, reward, done, info = env.reset()  # only use env to act and track profit

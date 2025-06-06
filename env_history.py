@@ -2,6 +2,10 @@ from typing import List, Dict
 
 
 class EnvironmentHistory:
+    """
+    维护交易环境中的历史信息，包括价格、新闻、反思等。
+    该类用于记录和管理交易过程中的状态和决策历史，以便在后续分析和决策中使用
+    """
     def __init__(self, base_query: str, start_state, memory: List[str], history: List[Dict[str, str]], args) -> None:
         self.args = args
         self._cur_query: str = f'{_get_base_query(base_query, memory)}'
